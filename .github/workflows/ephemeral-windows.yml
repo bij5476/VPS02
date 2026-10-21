@@ -1,0 +1,72 @@
+name: Ephemeral Windows over Tailscale
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration_minutes:
+        description: "How long the temporary Windows machine stays online (maximum 350 minutes)"
+        required: true
+        default: "350"
+        type: choice
+        options:
+          - "60"
+          - "120"
+          - "240"
+          - "350"
+
+concurrency:
+  group: ephemeral-windows
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  create-windows:
+    name: Temporary Windows
+    runs-on: windows-latest
+    timeout-minutes: 360
+    env:
+      RDP_USERNAME: ${{ secrets.RDP_USERNAME }}
+      RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+      SESSION_MINUTES: ${{ inputs.duration_minutes }}
+
+    steps:
+      - name: Validate required secrets
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:RDP_USERNAME) -or [string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
+            throw "Add RDP_USERNAME and RDP_PASSWORD as repository secrets before starting this workflow."
+          }
+
+      - name: Join the Tailnet
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+          hostname: vps02-${{ github.run_id }}
+
+      - name: Enable Remote Desktop
+        shell: pwsh
+        run: |
+          $securePassword = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
+          $user = Get-LocalUser -Name $env:RDP_USERNAME -ErrorAction SilentlyContinue
+
+          if ($null -eq $user) {
+            New-LocalUser -Name $env:RDP_USERNAME -Password $securePassword -PasswordNeverExpires -AccountNeverExpires | Out-Null
+          } else {
+            Set-LocalUser -Name $env:RDP_USERNAME -Password $securePassword
+          }
+
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $env:RDP_USERNAME -ErrorAction SilentlyContinue
+          Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          Set-Service -Name "TermService" -StartupType Automatic
+          Start-Service -Name "TermService"
+
+      - name: Keep the temporary machine available
+        shell: pwsh
+        run: |
+          $seconds = [int]$env:SESSION_MINUTES * 60
+          Start-Sleep -Seconds $seconds
